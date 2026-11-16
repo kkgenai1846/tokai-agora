@@ -1,10 +1,11 @@
 {
-  "name": "agora-voice-ai-hackathon-singapore-2026",
+  "name": "tokai-agora",
   "version": "0.1.0",
-  "description": "A script to customize the Agora hackathon template",
-  "author": "digitallysavvy",
-  "main": "update-templates.js",
+  "description": "Tokai — AI tutoring platform with real-time voice, gesture-controlled whiteboard, live concept map, and 3D visualisation",
   "scripts": {
+    "dev": "npm --prefix agent-samples/react-voice-client run dev",
+    "build": "npm --prefix agent-samples/react-voice-client run build",
+    "start": "npm --prefix agent-samples/react-voice-client run start",
     "setup": "node update-templates.js"
   },
   "dependencies": {

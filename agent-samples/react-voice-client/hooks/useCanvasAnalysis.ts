@@ -2,21 +2,6 @@
 
 import { useCallback, useRef } from "react"
 import type { Editor } from "tldraw"
-import { GoogleGenerativeAI } from "@google/generative-ai"
-
-const GEMINI_API_KEY = process.env.NEXT_PUBLIC_GEMINI_API_KEY
-const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null
-
-const CANVAS_ANALYSIS_PROMPT = `You are analyzing a whiteboard/canvas from an educational tutoring session.
-
-Describe what you see concisely in 1-2 sentences, focusing on:
-1. Any diagrams, mind maps, or educational content
-2. Any user annotations like circles, arrows, or highlights that indicate areas of interest
-3. Any handwritten notes or markings
-
-If you see circles, arrows pointing to something, or underlines, mention what the user seems to be highlighting or asking about.
-
-Keep your description brief and factual. Start with "The canvas shows..." or "I can see..."`
 
 export function useCanvasAnalysis() {
   const editorRef = useRef<Editor | null>(null)
@@ -59,36 +44,29 @@ export function useCanvasAnalysis() {
     }
   }, [])
 
-  // Analyze canvas with Gemini Vision
+  // Analyze canvas with server vision API
   const analyzeCanvas = useCallback(async (): Promise<string | null> => {
-    if (!genAI) {
-      console.error("Gemini not configured")
-      return null
-    }
-
     const base64Image = await captureCanvas()
     if (!base64Image) {
       return null
     }
 
     try {
-      const model = genAI.getGenerativeModel({ model: "gemini-3-flash-preview" })
+      const res = await fetch("/api/analyze-canvas", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: base64Image }),
+      })
 
-      const result = await model.generateContent([
-        { text: CANVAS_ANALYSIS_PROMPT },
-        {
-          inlineData: {
-            mimeType: "image/png",
-            data: base64Image,
-          },
-        },
-      ])
+      if (!res.ok) {
+        throw new Error(`Analyze canvas error: ${res.statusText}`)
+      }
 
-      const response = result.response.text()
-      return response.trim()
+      const data = await res.json()
+      return data.description || "The student highlighted elements on the whiteboard."
     } catch (error) {
       console.error("Error analyzing canvas:", error)
-      return null
+      return "The student highlighted elements on the whiteboard."
     }
   }, [captureCanvas])
 

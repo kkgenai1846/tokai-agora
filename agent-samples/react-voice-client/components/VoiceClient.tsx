@@ -53,7 +53,7 @@ const GestureCamera = dynamic(() => import("./GestureCamera").then(mod => ({ def
   ),
 })
 
-const DEFAULT_BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8082"
+const DEFAULT_BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "/api"
 const DEFAULT_PROFILE = process.env.NEXT_PUBLIC_DEFAULT_PROFILE || "VOICE"
 const THYMIA_ENABLED = process.env.NEXT_PUBLIC_ENABLE_THYMIA === "true"
 
@@ -146,6 +146,18 @@ export function VoiceClient() {
     agentUid,
     rtmClientRef,
   } = useAgoraVoiceClient()
+
+  // Standalone interactive tutor state (browser fallback when Agora keys not configured)
+  const [isStandalone, setIsStandalone] = useState(false)
+  const [standaloneMessages, setStandaloneMessages] = useState<any[]>([])
+  const [isSpeakingStandalone, setIsSpeakingStandalone] = useState(false)
+  const [isStandaloneMuted, setIsStandaloneMuted] = useState(false)
+  const recognitionRef = useRef<any>(null)
+
+  const activeConnected = isConnected || isStandalone
+  const activeMuted = isStandalone ? isStandaloneMuted : isMuted
+  const activeAgentSpeaking = isStandalone ? isSpeakingStandalone : isAgentSpeaking
+  const activeMessageList = isStandalone ? standaloneMessages : messageList
 
   // Diagram generator
   const diagramGenerator = useDiagramGenerator({
@@ -286,6 +298,142 @@ export function VoiceClient() {
     }
   }
 
+  // Standalone speech recognition
+  const startSpeechRecognition = useCallback(() => {
+    if (typeof window === "undefined") return
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    if (!SpeechRecognition) return
+
+    try {
+      const recognition = new SpeechRecognition()
+      recognition.continuous = true
+      recognition.interimResults = false
+      recognition.lang = language || "en-US"
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      recognition.onresult = (event: any) => {
+        const lastResultIndex = event.results.length - 1
+        const transcript = event.results[lastResultIndex][0]?.transcript?.trim()
+        if (transcript) {
+          sendStandaloneUserMessage(transcript)
+        }
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      recognition.onerror = (err: any) => {
+        console.warn("[SpeechRecognition] error:", err.error)
+      }
+
+      recognition.start()
+      recognitionRef.current = recognition
+    } catch (e) {
+      console.warn("Could not start speech recognition:", e)
+    }
+  }, [language])
+
+  const sendStandaloneUserMessage = useCallback(
+    async (text: string) => {
+      if (!text.trim()) return
+
+      let fullText = text
+      let canvasDesc: string | null = null
+      if (canvasAnalysis.hasContent()) {
+        try {
+          canvasDesc = await canvasAnalysis.analyzeCanvas()
+          if (canvasDesc) fullText = `[Context: ${canvasDesc}] ${text}`
+        } catch (e) {}
+      }
+
+      const userMsg = {
+        turn_id: Date.now(),
+        uid: "101",
+        text: fullText,
+        status: 2,
+        timestamp: Date.now(),
+      }
+      setStandaloneMessages((prev) => [...prev, userMsg])
+
+      try {
+        setIsSpeakingStandalone(true)
+        const res = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            message: text,
+            context: canvasDesc,
+            history: standaloneMessages.slice(-6).map((m) => ({
+              role: m.uid === "100" ? "assistant" : "user",
+              content: m.text,
+            })),
+          }),
+        })
+
+        const data = await res.json()
+        const reply = data.reply || "Let me explain that for you!"
+
+        const tutorMsg = {
+          turn_id: Date.now() + 1,
+          uid: "100",
+          text: reply,
+          status: 2,
+          timestamp: Date.now(),
+        }
+        setStandaloneMessages((prev) => [...prev, tutorMsg])
+
+        // Trigger diagram if tutor mentions drawing
+        if (
+          diagramGenerator.shouldGenerateDiagram(reply) ||
+          diagramGenerator.shouldGenerateDiagram(text) ||
+          reply.toLowerCase().includes("let me draw")
+        ) {
+          diagramGenerator.generate(text)
+        }
+
+        if (typeof window !== "undefined" && window.speechSynthesis) {
+          window.speechSynthesis.cancel()
+          const utterance = new SpeechSynthesisUtterance(reply.replace(/\[.*?\]/g, ""))
+          utterance.lang = language || "en-US"
+          utterance.onend = () => setIsSpeakingStandalone(false)
+          utterance.onerror = () => setIsSpeakingStandalone(false)
+          window.speechSynthesis.speak(utterance)
+        } else {
+          setIsSpeakingStandalone(false)
+        }
+      } catch (err) {
+        console.error("Standalone tutor error:", err)
+        setIsSpeakingStandalone(false)
+      }
+    },
+    [canvasAnalysis, diagramGenerator, language, standaloneMessages]
+  )
+
+  const startStandaloneMode = useCallback(
+    (welcomeGreeting?: string) => {
+      setIsStandalone(true)
+      const initialGreeting =
+        welcomeGreeting ||
+        greeting ||
+        "Hello! I am Tokai, your AI tutor. What would you like to explore today? You can speak with me, use hand gestures, or draw on the whiteboard!"
+      const tutorMsg = {
+        turn_id: Date.now(),
+        uid: "100",
+        text: initialGreeting,
+        status: 2,
+        timestamp: Date.now(),
+      }
+      setStandaloneMessages([tutorMsg])
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        window.speechSynthesis.cancel()
+        const utterance = new SpeechSynthesisUtterance(initialGreeting)
+        utterance.lang = language || "en-US"
+        window.speechSynthesis.speak(utterance)
+      }
+      startSpeechRecognition()
+    },
+    [greeting, language, startSpeechRecognition]
+  )
+
   const handleStart = async () => {
     setIsLoading(true)
     try {
@@ -309,7 +457,8 @@ export function VoiceClient() {
 
       // Phase 1: Get tokens only
       params.append("connect", "false")
-      const tokenUrl = `${backendUrl}/start-agent?${params.toString()}`
+      const targetBackend = backendUrl.trim() || "/api"
+      const tokenUrl = `${targetBackend}/start-agent?${params.toString()}`
       const tokenResponse = await fetch(tokenUrl)
 
       if (!tokenResponse.ok) {
@@ -319,52 +468,53 @@ export function VoiceClient() {
       const data = await tokenResponse.json()
       setChannelName(data.channel)
 
-      // Phase 2: Join channel first
-      await joinChannel({
-        appId: data.appid,
-        channel: data.channel,
-        token: data.token || null,
-        uid: parseInt(data.uid),
-        rtmUid: data.user_rtm_uid,
-        agentUid: data.agent?.uid ? String(data.agent.uid) : undefined,
-        agentRtmUid: data.agent_rtm_uid,
-        ...(selectedMic ? { microphoneId: selectedMic } : {}),
-      })
-
-      // Phase 3: Start the agent
-      params.delete("connect")
-      params.append("channel", data.channel)
-      params.append("debug", "true")
-      const agentUrl = `${backendUrl}/start-agent?${params.toString()}`
-      const agentResponse = await fetch(agentUrl)
-
-      if (!agentResponse.ok) {
-        throw new Error(`Agent start error: ${agentResponse.statusText}`)
-      }
-
-      const agentData = await agentResponse.json()
-
-      if (agentData.agent_response?.response) {
+      // Phase 2: If legitimate Agora credentials available, join Agora
+      if (data.appid && data.appid !== "tokai_standalone_mode" && !data.appid.startsWith("dummy")) {
         try {
-          const resp =
-            typeof agentData.agent_response.response === "string"
-              ? JSON.parse(agentData.agent_response.response)
-              : agentData.agent_response.response
-          if (resp.agent_id) {
-            setAgentId(resp.agent_id)
-            setSessionAgentId(resp.agent_id)
-          }
-        } catch {
-          // ignore parse errors
-        }
-      }
+          await joinChannel({
+            appId: data.appid,
+            channel: data.channel,
+            token: data.token || null,
+            uid: parseInt(data.uid),
+            rtmUid: data.user_rtm_uid,
+            agentUid: data.agent?.uid ? String(data.agent.uid) : undefined,
+            agentRtmUid: data.agent_rtm_uid,
+            ...(selectedMic ? { microphoneId: selectedMic } : {}),
+          })
 
-      if (agentData.debug?.agent_payload) {
-        setSessionPayload(redactSensitiveFields(agentData.debug.agent_payload))
+          // Phase 3: Start the agent
+          params.delete("connect")
+          params.append("channel", data.channel)
+          params.append("debug", "true")
+          const agentUrl = `${targetBackend}/start-agent?${params.toString()}`
+          const agentResponse = await fetch(agentUrl)
+
+          if (agentResponse.ok) {
+            const agentData = await agentResponse.json()
+            if (agentData.agent_response?.response) {
+              try {
+                const resp =
+                  typeof agentData.agent_response.response === "string"
+                    ? JSON.parse(agentData.agent_response.response)
+                    : agentData.agent_response.response
+                if (resp.agent_id) {
+                  setAgentId(resp.agent_id)
+                  setSessionAgentId(resp.agent_id)
+                }
+              } catch {}
+            }
+          }
+        } catch (agoraErr) {
+          console.warn("Agora cloud connect failed, launching interactive Browser Tutor Mode:", agoraErr)
+          startStandaloneMode(greeting)
+        }
+      } else {
+        // Direct interactive browser tutor mode
+        startStandaloneMode(greeting)
       }
     } catch (error) {
-      console.error("Failed to start:", error)
-      alert(`Failed to start: ${error instanceof Error ? error.message : "Unknown error"}`)
+      console.warn("Failed to reach backend, activating interactive Browser Tutor Mode:", error)
+      startStandaloneMode(greeting)
     } finally {
       setIsLoading(false)
     }
@@ -379,12 +529,25 @@ export function VoiceClient() {
   }, [autoConnect])
 
   const handleStop = async () => {
+    if (isStandalone) {
+      try {
+        recognitionRef.current?.stop()
+      } catch (e) {}
+      if (typeof window !== "undefined" && window.speechSynthesis) {
+        window.speechSynthesis.cancel()
+      }
+      setIsStandalone(false)
+      setStandaloneMessages([])
+      return
+    }
+
     if (agentId) {
       try {
+        const targetBackend = backendUrl.trim() || "/api"
         const params = new URLSearchParams({ agent_id: agentId })
         if (channelName) params.append("channel", channelName)
         if (profile.trim()) params.append("profile", profile.trim())
-        await fetch(`${backendUrl}/hangup-agent?${params}`)
+        await fetch(`${targetBackend}/hangup-agent?${params}`)
       } catch (e) {
         console.error("Hangup failed:", e)
       }
@@ -405,14 +568,17 @@ export function VoiceClient() {
 
   // Manual share canvas context with tutor
   const handleShareCanvas = async () => {
-    if (!isConnected || !canvasAnalysis.hasContent()) return
+    if (!activeConnected || !canvasAnalysis.hasContent()) return
 
     setIsSharingCanvas(true)
     try {
       const description = await canvasAnalysis.analyzeCanvas()
       if (description) {
-        // Send just the context - the user will ask the question via voice
-        await sendMessage(`[Canvas context: ${description}]`)
+        if (isStandalone) {
+          await sendStandaloneUserMessage(`[Looking at canvas: ${description}] Could you explain what is drawn here?`)
+        } else {
+          await sendMessage(`[Canvas context: ${description}]`)
+        }
       }
     } catch (error) {
       console.error("Error sharing canvas:", error)
@@ -422,28 +588,48 @@ export function VoiceClient() {
   }
 
   const handleSendMessage = async () => {
-    if (!chatMessage.trim() || !isConnected) return
+    if (!chatMessage.trim() || !activeConnected) return
+    const msg = chatMessage
+    setChatMessage("")
 
-    let messageToSend = chatMessage
-
-    // If canvas has content, analyze it and add context to the message
-    if (canvasAnalysis.hasContent()) {
-      setIsAnalyzingCanvas(true)
-      try {
-        const canvasDescription = await canvasAnalysis.analyzeCanvas()
-        if (canvasDescription) {
-          messageToSend = `[Context: ${canvasDescription}] ${chatMessage}`
+    if (isStandalone) {
+      await sendStandaloneUserMessage(msg)
+    } else {
+      let messageToSend = msg
+      if (canvasAnalysis.hasContent()) {
+        setIsAnalyzingCanvas(true)
+        try {
+          const canvasDescription = await canvasAnalysis.analyzeCanvas()
+          if (canvasDescription) {
+            messageToSend = `[Context: ${canvasDescription}] ${msg}`
+          }
+        } catch (error) {
+          console.error("Error analyzing canvas:", error)
+        } finally {
+          setIsAnalyzingCanvas(false)
         }
-      } catch (error) {
-        console.error("Error analyzing canvas:", error)
-      } finally {
-        setIsAnalyzingCanvas(false)
       }
+      await sendMessage(messageToSend)
     }
+  }
 
-    const success = await sendMessage(messageToSend)
-    if (success) {
-      setChatMessage("")
+  const handleToggleMute = () => {
+    if (isStandalone) {
+      setIsStandaloneMuted((prev) => {
+        const next = !prev
+        if (next) {
+          try {
+            recognitionRef.current?.stop()
+          } catch (e) {}
+        } else {
+          try {
+            recognitionRef.current?.start()
+          } catch (e) {}
+        }
+        return next
+      })
+    } else {
+      toggleMute()
     }
   }
 
@@ -476,7 +662,7 @@ export function VoiceClient() {
     whiteboard: "Whiteboard",
   }
 
-  if (!isConnected) {
+  if (!activeConnected) {
     // Pre-connection: Tokai-styled connection form
     return (
       <div className="flex h-screen flex-col bg-surface overflow-hidden">
@@ -576,7 +762,7 @@ export function VoiceClient() {
           onPromptChange={setPrompt}
           greeting={greeting}
           onGreetingChange={setGreeting}
-          disabled={isConnected}
+          disabled={activeConnected}
           selectedMicId={selectedMic}
           onMicChange={handleMicChange}
         >
@@ -615,7 +801,7 @@ export function VoiceClient() {
           <div className="absolute top-6 left-6 flex flex-col gap-2 z-10">
             <h1 className="text-2xl font-black font-headline text-primary tracking-tight">{sessionTitle}</h1>
             <p className="text-on-surface-variant text-sm font-medium">
-              {isAgentSpeaking ? "Tutor speaking..." : "Listening..."}
+              {activeAgentSpeaking ? "Tutor speaking..." : "Listening..."}
             </p>
           </div>
 
@@ -696,7 +882,7 @@ export function VoiceClient() {
                 content: (
                   <div className="flex flex-col h-full">
                     <div className="flex-grow overflow-y-auto custom-scrollbar pr-2 space-y-4">
-                      {messageList.map((msg, idx) => {
+                      {activeMessageList.map((msg, idx) => {
                         const isAgent = isAgentMessage(msg.uid)
                         const time = formatTime(msg.timestamp)
                         return (
@@ -725,7 +911,7 @@ export function VoiceClient() {
                         </div>
                       )}
 
-                      {messageList.length === 0 && !currentInProgressMessage && (
+                      {activeMessageList.length === 0 && !currentInProgressMessage && (
                         <div className="text-center py-8 text-on-surface-variant/50">
                           <p className="text-sm">Conversation will appear here...</p>
                         </div>
@@ -767,7 +953,7 @@ export function VoiceClient() {
                           clinical={clinical}
                           progress={thymiaProgress}
                           safety={thymiaSafety}
-                          isConnected={isConnected}
+                          isConnected={activeConnected}
                         />
                       ),
                     },
@@ -783,21 +969,21 @@ export function VoiceClient() {
         <div className="flex items-center gap-12">
           {/* Mic Toggle */}
           <button
-            onClick={toggleMute}
+            onClick={handleToggleMute}
             className="flex flex-col items-center gap-1 group"
           >
             <div
               className={cn(
                 "p-3 rounded-full transition-all group-hover:scale-110",
-                isMuted
+                activeMuted
                   ? "bg-error/10 text-error"
                   : "text-primary"
               )}
             >
-              {isMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
+              {activeMuted ? <MicOff className="w-6 h-6" /> : <Mic className="w-6 h-6" />}
             </div>
             <span className="text-[10px] font-bold uppercase tracking-widest text-primary/60">
-              {isMuted ? "Muted" : "Mic"}
+              {activeMuted ? "Muted" : "Mic"}
             </span>
           </button>
 
@@ -844,7 +1030,7 @@ export function VoiceClient() {
         onPromptChange={setPrompt}
         greeting={greeting}
         onGreetingChange={setGreeting}
-        disabled={isConnected}
+        disabled={activeConnected}
         selectedMicId={selectedMic}
         onMicChange={handleMicChange}
       >
